@@ -1,0 +1,11 @@
+Read AGENTS.md and scan the repository.
+
+Produce /docs/review-guardrails.md containing:
+- scope drift risks
+- security risks
+- tenancy risks
+- missing docs
+- missing tests
+- proposed corrections
+
+Do not modify code.

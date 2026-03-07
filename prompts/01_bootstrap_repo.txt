@@ -1,0 +1,12 @@
+Read AGENTS.md and /docs/specs/000-repo-bootstrap/spec.md.
+
+Implement only Spec 000.
+Requirements:
+- create approved monorepo structure
+- add placeholder README files where needed
+- set up lint, formatting, type-check, tests, and CI
+- add minimal web and api app shells
+- add local setup instructions
+
+Do not add business logic, auth, database models, or AI features.
+After changes, summarize files touched and validation performed.

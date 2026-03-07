@@ -1,0 +1,24 @@
+# OS artifacts
+.DS_Store
+
+# Node / package manager
+node_modules/
+.pnpm-store/
+
+# Build outputs
+.next/
+dist/
+build/
+coverage/
+
+# Env files
+.env
+.env.*
+!.env.example
+
+# Logs
+*.log
+
+# Editor
+.vscode/
+.idea/

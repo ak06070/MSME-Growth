@@ -1,0 +1,7 @@
+Read AGENTS.md and /docs/specs/002-auth-rbac/spec.md.
+
+Create the following files without implementing code:
+- /docs/specs/002-auth-rbac/tasks.md
+- /docs/specs/002-auth-rbac/architecture.md
+- /docs/specs/002-auth-rbac/risks.md
+- /docs/specs/002-auth-rbac/qa-checklist.md

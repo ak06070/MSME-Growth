@@ -1,0 +1,13 @@
+Read AGENTS.md and /docs/specs/002-auth-rbac/spec.md.
+
+Implement only Spec 002.
+Requirements:
+- user identity model
+- role and permission model
+- tenant-scoped authorization checks
+- protected routes or middleware
+- audit logging for mutating actions
+- tests for allowed and denied flows
+- docs updates
+
+Do not implement collections, cashflow, loan-readiness, or AI workflows.

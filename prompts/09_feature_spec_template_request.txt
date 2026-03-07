@@ -1,0 +1,16 @@
+Read AGENTS.md, /docs/master, and the current repository.
+
+Create a new spec for [FEATURE_NAME] using /docs/templates/spec-template.md.
+The spec must include:
+- purpose
+- in scope
+- out of scope
+- stakeholder impact
+- data model impact
+- API/UI impact
+- security constraints
+- audit-log impact
+- acceptance criteria
+- test plan
+
+Do not implement code.

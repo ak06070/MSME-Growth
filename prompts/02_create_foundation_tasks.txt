@@ -1,0 +1,9 @@
+Read AGENTS.md and /docs/specs/001-foundation/spec.md.
+
+Create the following files without implementing code:
+- /docs/specs/001-foundation/tasks.md
+- /docs/specs/001-foundation/architecture.md
+- /docs/specs/001-foundation/risks.md
+- /docs/specs/001-foundation/qa-checklist.md
+
+Use the templates under /docs/templates.

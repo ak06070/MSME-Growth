@@ -1,0 +1,12 @@
+Review the current diff only against AGENTS.md and the active spec.
+
+Output:
+- what matches the spec
+- what exceeds scope
+- missing tests
+- missing docs
+- security concerns
+- tenant isolation concerns
+- exact files that need changes
+
+Do not implement fixes unless asked.

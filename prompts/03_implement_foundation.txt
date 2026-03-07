@@ -1,0 +1,13 @@
+Read AGENTS.md and /docs/specs/001-foundation/spec.md.
+
+Implement only Spec 001.
+Requirements:
+- preserve narrow scope
+- create shared package boundaries
+- implement logging abstraction and audit-log abstraction
+- add feature-flag interface
+- add error-handling conventions
+- add placeholder module shells
+- add tests and docs
+
+Do not implement auth, workflows, ingestion, or AI execution.

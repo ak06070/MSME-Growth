@@ -1,0 +1,11 @@
+Read AGENTS.md and /docs/master.
+
+Propose the next three specs after 002 in this exact format:
+- spec id
+- title
+- purpose
+- dependencies
+- why now
+- top 5 acceptance criteria
+
+Do not implement code.

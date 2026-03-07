@@ -1,0 +1,13 @@
+Read AGENTS.md and everything under /docs/master.
+
+Create /docs/project-brief.md that summarizes:
+- product mission
+- business goals
+- phase-1 scope
+- non-goals
+- stakeholder roles
+- engineering constraints
+- security requirements
+- definition of done
+
+Do not implement code.
