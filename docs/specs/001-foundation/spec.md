@@ -1,5 +1,8 @@
 # Spec 001 - Platform Foundation
 
+- Status: Implemented
+- Last updated: 2026-03-08
+
 ## Purpose
 Establish a production-ready technical foundation for a multi-tenant MSME platform so later domain features can be delivered safely, consistently, and with strong engineering guardrails.
 

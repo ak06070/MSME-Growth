@@ -1,0 +1,21 @@
+{
+  "name": "@msme/web",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start",
+    "lint": "eslint \"{app,src}/**/*.{ts,tsx}\"",
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@msme/types": "workspace:*",
+    "@msme/ui": "workspace:*",
+    "next": "^15.2.2",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0"
+  }
+}

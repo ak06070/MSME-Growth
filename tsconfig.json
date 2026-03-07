@@ -1,0 +1,12 @@
+{
+  "files": [],
+  "references": [
+    { "path": "packages/types" },
+    { "path": "packages/ui" },
+    { "path": "packages/workflows" },
+    { "path": "packages/agents" },
+    { "path": "packages/connectors" },
+    { "path": "apps/api" },
+    { "path": "apps/web" }
+  ]
+}
