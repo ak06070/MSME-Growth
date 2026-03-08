@@ -24,6 +24,13 @@ import {
   isCashflowWorkflowRoleAllowed
 } from "./workflows/cashflow-summary";
 import { InMemoryCashflowSummaryStore } from "./workflows/cashflow-summary-store";
+import {
+  LOAN_READINESS_APPROVAL_STEP_ID,
+  LOAN_READINESS_WORKFLOW_TYPE,
+  createLoanReadinessWorkflowDefinition,
+  isLoanReadinessRoleAllowed
+} from "./workflows/loan-readiness";
+import { InMemoryLoanReadinessStore } from "./workflows/loan-readiness-store";
 
 const SESSION_COOKIE = "session_token";
 const SESSION_COOKIE_MAX_AGE_SECONDS = 8 * 60 * 60;
@@ -51,6 +58,7 @@ export interface ServerDeps {
   invoiceDomainStore?: InMemoryInvoiceDomainStore;
   workflowStore?: InMemoryWorkflowStore;
   cashflowSummaryStore?: InMemoryCashflowSummaryStore;
+  loanReadinessStore?: InMemoryLoanReadinessStore;
 }
 
 const resolveSessionId = (request: FastifyRequest): string | null => {
@@ -95,6 +103,7 @@ export const buildServer = (deps: ServerDeps = {}): FastifyInstance => {
   const invoiceDomainStore = deps.invoiceDomainStore ?? new InMemoryInvoiceDomainStore();
   const workflowStore = deps.workflowStore ?? new InMemoryWorkflowStore();
   const cashflowSummaryStore = deps.cashflowSummaryStore ?? new InMemoryCashflowSummaryStore();
+  const loanReadinessStore = deps.loanReadinessStore ?? new InMemoryLoanReadinessStore();
   const invoiceIngestionService = new InvoiceIngestionService(invoiceDomainStore, auditLogger);
   const workflowRegistry = new WorkflowRegistry();
   const workflowEngine = new WorkflowEngine(workflowRegistry, workflowStore, async (event) => {
@@ -115,6 +124,7 @@ export const buildServer = (deps: ServerDeps = {}): FastifyInstance => {
 
   workflowEngine.registerWorkflow(createCollectionsFollowupWorkflowDefinition());
   workflowEngine.registerWorkflow(createCashflowSummaryWorkflowDefinition());
+  workflowEngine.registerWorkflow(createLoanReadinessWorkflowDefinition());
 
   const app = Fastify({ logger: false });
 
@@ -191,6 +201,19 @@ export const buildServer = (deps: ServerDeps = {}): FastifyInstance => {
     }
 
     if (!isCashflowWorkflowRoleAllowed(request.authContext.membership.roles)) {
+      return reply.status(403).send({ error: "FORBIDDEN" });
+    }
+  };
+
+  const requireLoanReadinessAccess = async (
+    request: FastifyRequest,
+    reply: FastifyReply
+  ): Promise<void> => {
+    if (!request.authContext || !request.sessionId) {
+      return requireAuth(request, reply);
+    }
+
+    if (!isLoanReadinessRoleAllowed(request.authContext.membership.roles)) {
       return reply.status(403).send({ error: "FORBIDDEN" });
     }
   };
@@ -617,6 +640,189 @@ export const buildServer = (deps: ServerDeps = {}): FastifyInstance => {
         events: workflowStore.listEvents(execution.id),
         snapshot: summarySnapshotId ? cashflowSummaryStore.get(summarySnapshotId) : null
       });
+    }
+  );
+
+  app.post(
+    "/workflows/loan-readiness/create",
+    { preHandler: requireLoanReadinessAccess },
+    async (request, reply) => {
+      const context = request.authContext;
+      const body = request.body as { name?: string };
+
+      if (!context) {
+        return reply.status(401).send({ error: "UNAUTHENTICATED" });
+      }
+
+      const workspace = loanReadinessStore.createWorkspace({
+        tenantId: context.membership.tenantId,
+        organizationId: context.membership.organizationId,
+        name: body?.name ?? "Loan Readiness Workspace"
+      });
+
+      return reply.status(201).send({ workspace });
+    }
+  );
+
+  app.post(
+    "/workflows/loan-readiness/:workspaceId/checklist",
+    { preHandler: requireLoanReadinessAccess },
+    async (request, reply) => {
+      const context = request.authContext;
+      const params = request.params as { workspaceId: string };
+      const body = request.body as {
+        checklistItems?: Array<{ key: string; completed: boolean }>;
+        riskFlags?: string[];
+      };
+
+      if (!context) {
+        return reply.status(401).send({ error: "UNAUTHENTICATED" });
+      }
+
+      if (!body?.checklistItems || body.checklistItems.length === 0) {
+        return reply.status(400).send({ error: "INVALID_CHECKLIST_PAYLOAD" });
+      }
+
+      const workspace = loanReadinessStore.getWorkspace(params.workspaceId);
+
+      if (!workspace) {
+        return reply.status(404).send({ error: "WORKSPACE_NOT_FOUND" });
+      }
+
+      if (
+        workspace.tenantId !== context.membership.tenantId ||
+        workspace.organizationId !== context.membership.organizationId
+      ) {
+        return reply.status(403).send({ error: "FORBIDDEN_TENANT_SCOPE" });
+      }
+
+      const updated = loanReadinessStore.updateChecklist({
+        workspaceId: params.workspaceId,
+        checklistItems: body.checklistItems,
+        riskFlags: body.riskFlags
+      });
+
+      return reply.status(200).send({ workspace: updated });
+    }
+  );
+
+  app.post(
+    "/workflows/loan-readiness/:workspaceId/export-start",
+    { preHandler: requireLoanReadinessAccess },
+    async (request, reply) => {
+      const context = request.authContext;
+      const params = request.params as { workspaceId: string };
+
+      if (!context) {
+        return reply.status(401).send({ error: "UNAUTHENTICATED" });
+      }
+
+      const workspace = loanReadinessStore.getWorkspace(params.workspaceId);
+
+      if (!workspace) {
+        return reply.status(404).send({ error: "WORKSPACE_NOT_FOUND" });
+      }
+
+      if (
+        workspace.tenantId !== context.membership.tenantId ||
+        workspace.organizationId !== context.membership.organizationId
+      ) {
+        return reply.status(403).send({ error: "FORBIDDEN_TENANT_SCOPE" });
+      }
+
+      const execution = await workflowEngine.startWorkflow({
+        workflowType: LOAN_READINESS_WORKFLOW_TYPE,
+        tenantId: context.membership.tenantId,
+        organizationId: context.membership.organizationId,
+        triggerType: "manual",
+        actorId: context.user.id,
+        payload: {
+          workspace
+        }
+      });
+
+      return reply.status(200).send({
+        executionId: execution.id,
+        workflowStatus: execution.status,
+        workspace
+      });
+    }
+  );
+
+  app.post(
+    "/workflows/loan-readiness/:executionId/approve-export",
+    { preHandler: requireLoanReadinessAccess },
+    async (request, reply) => {
+      const context = request.authContext;
+      const params = request.params as { executionId: string };
+      const body = request.body as { approved?: boolean; stepId?: string };
+
+      if (!context) {
+        return reply.status(401).send({ error: "UNAUTHENTICATED" });
+      }
+
+      const execution = workflowStore.getExecution(params.executionId);
+
+      if (!execution || execution.workflowType !== LOAN_READINESS_WORKFLOW_TYPE) {
+        return reply.status(404).send({ error: "WORKFLOW_NOT_FOUND" });
+      }
+
+      if (
+        execution.tenantId !== context.membership.tenantId ||
+        execution.organizationId !== context.membership.organizationId
+      ) {
+        return reply.status(403).send({ error: "FORBIDDEN_TENANT_SCOPE" });
+      }
+
+      const updated = await workflowEngine.decideApproval({
+        executionId: params.executionId,
+        stepId: body?.stepId ?? LOAN_READINESS_APPROVAL_STEP_ID,
+        actorId: context.user.id,
+        approved: body?.approved ?? true
+      });
+
+      const workspacePayload = updated.payload?.workspace as { id: string } | undefined;
+
+      if (updated.status === "completed" && workspacePayload?.id) {
+        loanReadinessStore.markExported({
+          workspaceId: workspacePayload.id,
+          exportSnapshotPath: `/exports/loan-readiness/${workspacePayload.id}.json`
+        });
+      }
+
+      return reply.status(200).send({
+        executionId: updated.id,
+        workflowStatus: updated.status,
+        workspace: workspacePayload?.id ? loanReadinessStore.getWorkspace(workspacePayload.id) : null
+      });
+    }
+  );
+
+  app.get(
+    "/workflows/loan-readiness/:workspaceId",
+    { preHandler: requireLoanReadinessAccess },
+    async (request, reply) => {
+      const context = request.authContext;
+      const params = request.params as { workspaceId: string };
+
+      if (!context) {
+        return reply.status(401).send({ error: "UNAUTHENTICATED" });
+      }
+
+      const workspace = loanReadinessStore.getWorkspace(params.workspaceId);
+
+      if (!workspace) {
+        return reply.status(404).send({ error: "WORKSPACE_NOT_FOUND" });
+      }
+
+      if (
+        workspace.tenantId !== context.membership.tenantId ||
+        workspace.organizationId !== context.membership.organizationId
+      ) {
+        return reply.status(403).send({ error: "FORBIDDEN_TENANT_SCOPE" });
+      }
+
+      return reply.status(200).send({ workspace });
     }
   );
 

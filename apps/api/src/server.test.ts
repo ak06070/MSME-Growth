@@ -514,4 +514,89 @@ describe("api auth and tenancy foundation", () => {
 
     await app.close();
   });
+
+  it("creates loan-readiness workspace and completes export approval flow", async () => {
+    const app = buildServer();
+    const cookie = await loginAsAdmin(app);
+
+    const created = await app.inject({
+      method: "POST",
+      url: "/workflows/loan-readiness/create",
+      headers: { cookie },
+      payload: {
+        name: "FY26 Loan Prep"
+      }
+    });
+
+    expect(created.statusCode).toBe(201);
+    const workspaceId = created.json().workspace.id as string;
+
+    const checklistUpdate = await app.inject({
+      method: "POST",
+      url: `/workflows/loan-readiness/${workspaceId}/checklist`,
+      headers: { cookie },
+      payload: {
+        checklistItems: [
+          { key: "financial_statements", completed: true },
+          { key: "gst_references", completed: true },
+          { key: "kyc_documents", completed: true }
+        ],
+        riskFlags: []
+      }
+    });
+
+    expect(checklistUpdate.statusCode).toBe(200);
+    expect(checklistUpdate.json().workspace.checklistProgress).toBe(100);
+
+    const exportStart = await app.inject({
+      method: "POST",
+      url: `/workflows/loan-readiness/${workspaceId}/export-start`,
+      headers: { cookie }
+    });
+
+    expect(exportStart.statusCode).toBe(200);
+    expect(exportStart.json().workflowStatus).toBe("awaiting_approval");
+
+    const executionId = exportStart.json().executionId as string;
+
+    const exportApprove = await app.inject({
+      method: "POST",
+      url: `/workflows/loan-readiness/${executionId}/approve-export`,
+      headers: { cookie },
+      payload: {
+        approved: true
+      }
+    });
+
+    expect(exportApprove.statusCode).toBe(200);
+    expect(exportApprove.json().workflowStatus).toBe("completed");
+    expect(exportApprove.json().workspace.status).toBe("submitted");
+
+    const workspaceDetails = await app.inject({
+      method: "GET",
+      url: `/workflows/loan-readiness/${workspaceId}`,
+      headers: { cookie }
+    });
+
+    expect(workspaceDetails.statusCode).toBe(200);
+    expect(workspaceDetails.json().workspace.exportSnapshotPath).toContain(workspaceId);
+
+    await app.close();
+  });
+
+  it("rejects unauthenticated loan-readiness workspace creation", async () => {
+    const app = buildServer();
+
+    const response = await app.inject({
+      method: "POST",
+      url: "/workflows/loan-readiness/create",
+      payload: {
+        name: "Unauthenticated workspace"
+      }
+    });
+
+    expect(response.statusCode).toBe(401);
+
+    await app.close();
+  });
 });
