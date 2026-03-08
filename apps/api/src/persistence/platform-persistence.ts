@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { Pool } from "pg";
 import type {
   AuditEvent,
@@ -62,6 +63,7 @@ export class PostgresPlatformPersistence implements PlatformPersistence {
     await this.pool.query(
       `
       insert into audit_events (
+        id,
         actor_id,
         tenant_id,
         organization_id,
@@ -72,9 +74,10 @@ export class PostgresPlatformPersistence implements PlatformPersistence {
         timestamp,
         metadata
       )
-      values ($1,$2,$3,$4,$5,$6,$7,$8,$9::jsonb)
+      values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
       `,
       [
+        randomUUID(),
         event.actorId ?? null,
         event.tenantId,
         event.organizationId ?? null,
@@ -134,6 +137,8 @@ export class PostgresPlatformPersistence implements PlatformPersistence {
   }
 
   async saveNotificationTemplate(template: NotificationTemplate): Promise<void> {
+    await this.ensureOrganizationRecord(template.tenantId, template.organizationId);
+
     await this.pool.query(
       `
       insert into notification_templates (
@@ -176,10 +181,12 @@ export class PostgresPlatformPersistence implements PlatformPersistence {
   }
 
   async saveNotificationRecord(record: NotificationRecordV2): Promise<void> {
+    await this.ensureOrganizationRecord(record.tenantId, record.organizationId);
+
     await this.pool.query(
       `
       insert into notification_records (
-        notification_id,
+        id,
         tenant_id,
         organization_id,
         channel,
@@ -199,10 +206,12 @@ export class PostgresPlatformPersistence implements PlatformPersistence {
         failure_reason,
         retry_eligible,
         retry_count,
-        next_retry_at
+        next_retry_at,
+        created_at,
+        updated_at
       )
-      values ($1,$2,$3,$4,$5,$6,$7,$8::jsonb,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21)
-      on conflict (notification_id) do update
+      values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23)
+      on conflict (id) do update
       set
         status = excluded.status,
         approval_state = excluded.approval_state,
@@ -236,7 +245,9 @@ export class PostgresPlatformPersistence implements PlatformPersistence {
         record.failureReason ?? null,
         record.retryEligible,
         record.retryCount,
-        record.nextRetryAt ?? null
+        record.nextRetryAt ?? null,
+        record.queuedAt,
+        record.queuedAt
       ]
     );
   }
@@ -315,6 +326,29 @@ export class PostgresPlatformPersistence implements PlatformPersistence {
 
   async close(): Promise<void> {
     await this.pool.end();
+  }
+
+  private async ensureOrganizationRecord(
+    tenantId: string,
+    organizationId: string
+  ): Promise<void> {
+    const now = new Date().toISOString();
+
+    await this.pool.query(
+      `
+      insert into organizations (
+        id,
+        tenant_id,
+        name,
+        status,
+        created_at,
+        updated_at
+      )
+      values ($1,$2,$3,'active',$4,$5)
+      on conflict do nothing
+      `,
+      [organizationId, tenantId, `Persisted ${organizationId}`, now, now]
+    );
   }
 }
 

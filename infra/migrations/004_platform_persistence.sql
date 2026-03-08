@@ -2,7 +2,7 @@
 -- Connector runs, notification layer, and durable audit events.
 
 create table if not exists audit_events (
-  id bigserial primary key,
+  id text primary key,
   actor_id text,
   tenant_id text not null,
   organization_id text,
@@ -10,9 +10,9 @@ create table if not exists audit_events (
   resource_type text not null,
   resource_id text,
   outcome text not null,
-  timestamp timestamptz not null,
-  metadata jsonb not null default '{}'::jsonb,
-  created_at timestamptz not null default now()
+  timestamp text not null,
+  metadata text,
+  created_at text not null default now()::text
 );
 
 create table if not exists connector_runs (
@@ -52,30 +52,43 @@ create table if not exists notification_templates (
 );
 
 create table if not exists notification_records (
-  notification_id text primary key,
+  id text primary key,
   tenant_id text not null,
   organization_id text not null,
   channel text not null,
   template_key text not null,
-  template_version integer not null,
+  template_version integer,
   recipient_ref text not null,
-  variables jsonb not null,
+  variables text,
   correlation_ref text,
   workflow_ref text,
   status text not null,
-  requires_approval boolean not null,
-  approval_state text not null,
-  queued_at timestamptz not null,
-  sent_at timestamptz,
-  dismissed_at timestamptz,
+  requires_approval boolean not null default false,
+  approval_state text not null default 'not_required',
+  queued_at text,
+  sent_at text,
+  dismissed_at text,
   failure_code text,
   failure_reason text,
-  retry_eligible boolean not null,
-  retry_count integer not null,
-  next_retry_at timestamptz,
-  created_at timestamptz not null default now(),
-  updated_at timestamptz not null default now()
+  retry_eligible boolean not null default false,
+  retry_count integer not null default 0,
+  next_retry_at text,
+  created_at text not null default now()::text,
+  updated_at text not null default now()::text
 );
+
+alter table notification_records add column if not exists template_version integer;
+alter table notification_records add column if not exists variables text;
+alter table notification_records add column if not exists correlation_ref text;
+alter table notification_records add column if not exists workflow_ref text;
+alter table notification_records add column if not exists requires_approval boolean default false;
+alter table notification_records add column if not exists approval_state text default 'not_required';
+alter table notification_records add column if not exists queued_at text;
+alter table notification_records add column if not exists dismissed_at text;
+alter table notification_records add column if not exists failure_code text;
+alter table notification_records add column if not exists retry_eligible boolean default false;
+alter table notification_records add column if not exists retry_count integer default 0;
+alter table notification_records add column if not exists next_retry_at text;
 
 create index if not exists idx_notification_records_scope
   on notification_records (tenant_id, organization_id, channel, status);
