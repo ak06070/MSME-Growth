@@ -2,6 +2,7 @@ import cookie from "@fastify/cookie";
 import Fastify, { type FastifyInstance, type FastifyReply, type FastifyRequest } from "fastify";
 import { randomUUID } from "node:crypto";
 import type { PermissionKey, RoleKey, UserStatus } from "@msme/types";
+import { InMemoryWorkflowStore, WorkflowEngine, WorkflowRegistry } from "@msme/workflows";
 import { InMemoryAuditLogger } from "./audit";
 import { InMemoryAuthStore, type AuthContext } from "./auth-store";
 import { loadApiEnv } from "./env";
@@ -9,6 +10,12 @@ import { InMemoryInvoiceDomainStore } from "./ingestion/invoice-domain-store";
 import { InvoiceIngestionService } from "./ingestion/invoice-ingestion-service";
 import { createLogger } from "./logger";
 import { noopObservabilityHooks } from "./observability";
+import {
+  COLLECTIONS_APPROVAL_STEP_ID,
+  COLLECTIONS_WORKFLOW_TYPE,
+  createCollectionsFollowupWorkflowDefinition,
+  isCollectionsWorkflowRoleAllowed
+} from "./workflows/collections-followup";
 
 const SESSION_COOKIE = "session_token";
 const SESSION_COOKIE_MAX_AGE_SECONDS = 8 * 60 * 60;
@@ -34,6 +41,7 @@ export interface ServerDeps {
   auditLogger?: InMemoryAuditLogger;
   authStore?: InMemoryAuthStore;
   invoiceDomainStore?: InMemoryInvoiceDomainStore;
+  workflowStore?: InMemoryWorkflowStore;
 }
 
 const resolveSessionId = (request: FastifyRequest): string | null => {
@@ -76,7 +84,26 @@ export const buildServer = (deps: ServerDeps = {}): FastifyInstance => {
   const auditLogger = deps.auditLogger ?? new InMemoryAuditLogger();
   const authStore = deps.authStore ?? new InMemoryAuthStore();
   const invoiceDomainStore = deps.invoiceDomainStore ?? new InMemoryInvoiceDomainStore();
+  const workflowStore = deps.workflowStore ?? new InMemoryWorkflowStore();
   const invoiceIngestionService = new InvoiceIngestionService(invoiceDomainStore, auditLogger);
+  const workflowRegistry = new WorkflowRegistry();
+  const workflowEngine = new WorkflowEngine(workflowRegistry, workflowStore, async (event) => {
+    await auditLogger.log({
+      action: "admin",
+      actorId: "workflow_engine",
+      tenantId: event.tenantId,
+      organizationId: event.organizationId,
+      resourceType: "workflow_event",
+      resourceId: event.workflowExecutionId,
+      outcome: "success",
+      timestamp: event.timestamp,
+      metadata: {
+        eventType: event.eventType
+      }
+    });
+  });
+
+  workflowEngine.registerWorkflow(createCollectionsFollowupWorkflowDefinition());
 
   const app = Fastify({ logger: false });
 
@@ -130,6 +157,19 @@ export const buildServer = (deps: ServerDeps = {}): FastifyInstance => {
         return reply.status(403).send({ error: "FORBIDDEN" });
       }
     };
+
+  const requireCollectionsWorkflowAccess = async (
+    request: FastifyRequest,
+    reply: FastifyReply
+  ): Promise<void> => {
+    if (!request.authContext || !request.sessionId) {
+      return requireAuth(request, reply);
+    }
+
+    if (!isCollectionsWorkflowRoleAllowed(request.authContext.membership.roles)) {
+      return reply.status(403).send({ error: "FORBIDDEN" });
+    }
+  };
 
   app.addHook("onRequest", async (request, reply) => {
     const correlationId = request.headers["x-correlation-id"]?.toString() ?? randomUUID();
@@ -294,6 +334,147 @@ export const buildServer = (deps: ServerDeps = {}): FastifyInstance => {
 
     return reply.status(200).send(result);
   });
+
+  app.post(
+    "/workflows/collections-followup/start",
+    { preHandler: requireCollectionsWorkflowAccess },
+    async (request, reply) => {
+      const context = request.authContext;
+
+      if (!context) {
+        return reply.status(401).send({ error: "UNAUTHENTICATED" });
+      }
+
+      const body = request.body as { triggerType?: "manual" | "scheduled" | "event" };
+      const triggerType = body?.triggerType ?? "manual";
+      const today = new Date();
+
+      const overdueInvoices = invoiceDomainStore
+        .listInvoices()
+        .filter((invoice) => {
+          if (
+            invoice.tenantId !== context.membership.tenantId ||
+            invoice.organizationId !== context.membership.organizationId
+          ) {
+            return false;
+          }
+
+          if (invoice.outstandingAmount <= 0) {
+            return false;
+          }
+
+          return new Date(invoice.dueDate).getTime() < today.getTime();
+        })
+        .map((invoice) => ({
+          invoiceId: invoice.id,
+          invoiceNumber: invoice.invoiceNumber,
+          dueDate: invoice.dueDate,
+          outstandingAmount: invoice.outstandingAmount,
+          customerId: invoice.customerId
+        }));
+
+      const execution = await workflowEngine.startWorkflow({
+        workflowType: COLLECTIONS_WORKFLOW_TYPE,
+        tenantId: context.membership.tenantId,
+        organizationId: context.membership.organizationId,
+        triggerType,
+        actorId: context.user.id,
+        payload: {
+          overdueInvoices
+        }
+      });
+
+      await auditLogger.log({
+        action: "admin",
+        actorId: context.user.id,
+        tenantId: context.membership.tenantId,
+        organizationId: context.membership.organizationId,
+        resourceType: "collections_followup_start",
+        resourceId: execution.id,
+        outcome: "success",
+        timestamp: new Date().toISOString(),
+        metadata: {
+          overdueCount: overdueInvoices.length
+        }
+      });
+
+      return reply.status(200).send({
+        executionId: execution.id,
+        workflowStatus: execution.status,
+        overdueCount: overdueInvoices.length
+      });
+    }
+  );
+
+  app.post(
+    "/workflows/:executionId/approve",
+    { preHandler: requireCollectionsWorkflowAccess },
+    async (request, reply) => {
+      const context = request.authContext;
+      const params = request.params as { executionId: string };
+      const body = request.body as { stepId?: string; approved?: boolean };
+
+      if (!context) {
+        return reply.status(401).send({ error: "UNAUTHENTICATED" });
+      }
+
+      const execution = workflowStore.getExecution(params.executionId);
+
+      if (!execution) {
+        return reply.status(404).send({ error: "WORKFLOW_NOT_FOUND" });
+      }
+
+      if (
+        execution.tenantId !== context.membership.tenantId ||
+        execution.organizationId !== context.membership.organizationId
+      ) {
+        return reply.status(403).send({ error: "FORBIDDEN_TENANT_SCOPE" });
+      }
+
+      const updated = await workflowEngine.decideApproval({
+        executionId: params.executionId,
+        stepId: body?.stepId ?? COLLECTIONS_APPROVAL_STEP_ID,
+        actorId: context.user.id,
+        approved: body?.approved ?? true
+      });
+
+      return reply.status(200).send({
+        executionId: updated.id,
+        workflowStatus: updated.status
+      });
+    }
+  );
+
+  app.get(
+    "/workflows/:executionId",
+    { preHandler: requireCollectionsWorkflowAccess },
+    async (request, reply) => {
+      const context = request.authContext;
+      const params = request.params as { executionId: string };
+
+      if (!context) {
+        return reply.status(401).send({ error: "UNAUTHENTICATED" });
+      }
+
+      const execution = workflowStore.getExecution(params.executionId);
+
+      if (!execution) {
+        return reply.status(404).send({ error: "WORKFLOW_NOT_FOUND" });
+      }
+
+      if (
+        execution.tenantId !== context.membership.tenantId ||
+        execution.organizationId !== context.membership.organizationId
+      ) {
+        return reply.status(403).send({ error: "FORBIDDEN_TENANT_SCOPE" });
+      }
+
+      return reply.status(200).send({
+        execution,
+        events: workflowStore.listEvents(execution.id)
+      });
+    }
+  );
 
   app.post(
     "/admin/users/invite",

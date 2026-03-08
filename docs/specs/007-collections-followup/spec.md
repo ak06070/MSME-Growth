@@ -1,6 +1,6 @@
 # Spec 007 - Collections Follow-up Workflow
 
-- Status: Approved for implementation
+- Status: Implemented
 - Last updated: 2026-03-08
 - Depends on: Spec 005 CSV Invoice Ingestion, Spec 006 Workflow Engine
 

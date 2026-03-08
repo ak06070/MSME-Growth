@@ -362,4 +362,81 @@ describe("api auth and tenancy foundation", () => {
 
     await app.close();
   });
+
+  it("starts and completes collections follow-up workflow", async () => {
+    const app = buildServer();
+    const cookie = await loginAsAdmin(app);
+
+    const overdueCsv = [
+      "invoice_number,invoice_date,due_date,customer_external_code,customer_name,subtotal_amount,tax_amount,total_amount,currency",
+      "INV-OVERDUE-001,2026-01-01,2026-01-15,CUST200,Overdue Customer,1500,270,1770,INR"
+    ].join("\n");
+
+    await app.inject({
+      method: "POST",
+      url: "/ingestion/invoices/csv",
+      headers: { cookie },
+      payload: { csvContent: overdueCsv }
+    });
+
+    const start = await app.inject({
+      method: "POST",
+      url: "/workflows/collections-followup/start",
+      headers: { cookie },
+      payload: {
+        triggerType: "manual"
+      }
+    });
+
+    expect(start.statusCode).toBe(200);
+    expect(start.json().workflowStatus).toBe("awaiting_approval");
+    expect(start.json().overdueCount).toBeGreaterThan(0);
+
+    const executionId = start.json().executionId as string;
+
+    const approve = await app.inject({
+      method: "POST",
+      url: `/workflows/${executionId}/approve`,
+      headers: { cookie },
+      payload: {
+        approved: true
+      }
+    });
+
+    expect(approve.statusCode).toBe(200);
+    expect(approve.json().workflowStatus).toBe("completed");
+
+    const details = await app.inject({
+      method: "GET",
+      url: `/workflows/${executionId}`,
+      headers: { cookie }
+    });
+
+    expect(details.statusCode).toBe(200);
+    expect(details.json().execution.status).toBe("completed");
+    expect(
+      details
+        .json()
+        .events.map((event: { eventType: string }) => event.eventType)
+        .includes("workflow_completed")
+    ).toBe(true);
+
+    await app.close();
+  });
+
+  it("rejects unauthenticated collections workflow start", async () => {
+    const app = buildServer();
+
+    const response = await app.inject({
+      method: "POST",
+      url: "/workflows/collections-followup/start",
+      payload: {
+        triggerType: "manual"
+      }
+    });
+
+    expect(response.statusCode).toBe(401);
+
+    await app.close();
+  });
 });

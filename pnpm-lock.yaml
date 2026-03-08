@@ -56,6 +56,9 @@ importers:
       '@msme/types':
         specifier: workspace:*
         version: link:../../packages/types
+      '@msme/workflows':
+        specifier: workspace:*
+        version: link:../../packages/workflows
       fastify:
         specifier: ^5.2.1
         version: 5.8.2
