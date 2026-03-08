@@ -16,6 +16,14 @@ import {
   createCollectionsFollowupWorkflowDefinition,
   isCollectionsWorkflowRoleAllowed
 } from "./workflows/collections-followup";
+import {
+  CASHFLOW_APPROVAL_STEP_ID,
+  CASHFLOW_WORKFLOW_TYPE,
+  buildCashflowSummary,
+  createCashflowSummaryWorkflowDefinition,
+  isCashflowWorkflowRoleAllowed
+} from "./workflows/cashflow-summary";
+import { InMemoryCashflowSummaryStore } from "./workflows/cashflow-summary-store";
 
 const SESSION_COOKIE = "session_token";
 const SESSION_COOKIE_MAX_AGE_SECONDS = 8 * 60 * 60;
@@ -42,6 +50,7 @@ export interface ServerDeps {
   authStore?: InMemoryAuthStore;
   invoiceDomainStore?: InMemoryInvoiceDomainStore;
   workflowStore?: InMemoryWorkflowStore;
+  cashflowSummaryStore?: InMemoryCashflowSummaryStore;
 }
 
 const resolveSessionId = (request: FastifyRequest): string | null => {
@@ -85,6 +94,7 @@ export const buildServer = (deps: ServerDeps = {}): FastifyInstance => {
   const authStore = deps.authStore ?? new InMemoryAuthStore();
   const invoiceDomainStore = deps.invoiceDomainStore ?? new InMemoryInvoiceDomainStore();
   const workflowStore = deps.workflowStore ?? new InMemoryWorkflowStore();
+  const cashflowSummaryStore = deps.cashflowSummaryStore ?? new InMemoryCashflowSummaryStore();
   const invoiceIngestionService = new InvoiceIngestionService(invoiceDomainStore, auditLogger);
   const workflowRegistry = new WorkflowRegistry();
   const workflowEngine = new WorkflowEngine(workflowRegistry, workflowStore, async (event) => {
@@ -104,6 +114,7 @@ export const buildServer = (deps: ServerDeps = {}): FastifyInstance => {
   });
 
   workflowEngine.registerWorkflow(createCollectionsFollowupWorkflowDefinition());
+  workflowEngine.registerWorkflow(createCashflowSummaryWorkflowDefinition());
 
   const app = Fastify({ logger: false });
 
@@ -167,6 +178,19 @@ export const buildServer = (deps: ServerDeps = {}): FastifyInstance => {
     }
 
     if (!isCollectionsWorkflowRoleAllowed(request.authContext.membership.roles)) {
+      return reply.status(403).send({ error: "FORBIDDEN" });
+    }
+  };
+
+  const requireCashflowWorkflowAccess = async (
+    request: FastifyRequest,
+    reply: FastifyReply
+  ): Promise<void> => {
+    if (!request.authContext || !request.sessionId) {
+      return requireAuth(request, reply);
+    }
+
+    if (!isCashflowWorkflowRoleAllowed(request.authContext.membership.roles)) {
       return reply.status(403).send({ error: "FORBIDDEN" });
     }
   };
@@ -472,6 +496,126 @@ export const buildServer = (deps: ServerDeps = {}): FastifyInstance => {
       return reply.status(200).send({
         execution,
         events: workflowStore.listEvents(execution.id)
+      });
+    }
+  );
+
+  app.post(
+    "/workflows/cashflow-summary/generate",
+    { preHandler: requireCashflowWorkflowAccess },
+    async (request, reply) => {
+      const context = request.authContext;
+      const body = request.body as {
+        triggerType?: "manual" | "scheduled" | "event";
+        windowDays?: number;
+      };
+
+      if (!context) {
+        return reply.status(401).send({ error: "UNAUTHENTICATED" });
+      }
+
+      const windowDays = body?.windowDays ?? 30;
+      const snapshot = buildCashflowSummary({
+        tenantId: context.membership.tenantId,
+        organizationId: context.membership.organizationId,
+        invoices: invoiceDomainStore.listInvoices(),
+        windowDays,
+        now: new Date(),
+        snapshotId: randomUUID()
+      });
+
+      cashflowSummaryStore.save(snapshot);
+
+      const execution = await workflowEngine.startWorkflow({
+        workflowType: CASHFLOW_WORKFLOW_TYPE,
+        tenantId: context.membership.tenantId,
+        organizationId: context.membership.organizationId,
+        triggerType: body?.triggerType ?? "manual",
+        actorId: context.user.id,
+        payload: {
+          snapshot
+        }
+      });
+
+      return reply.status(200).send({
+        executionId: execution.id,
+        workflowStatus: execution.status,
+        snapshot
+      });
+    }
+  );
+
+  app.post(
+    "/workflows/cashflow-summary/:executionId/approve",
+    { preHandler: requireCashflowWorkflowAccess },
+    async (request, reply) => {
+      const context = request.authContext;
+      const params = request.params as { executionId: string };
+      const body = request.body as { stepId?: string; approved?: boolean };
+
+      if (!context) {
+        return reply.status(401).send({ error: "UNAUTHENTICATED" });
+      }
+
+      const execution = workflowStore.getExecution(params.executionId);
+
+      if (!execution || execution.workflowType !== CASHFLOW_WORKFLOW_TYPE) {
+        return reply.status(404).send({ error: "WORKFLOW_NOT_FOUND" });
+      }
+
+      if (
+        execution.tenantId !== context.membership.tenantId ||
+        execution.organizationId !== context.membership.organizationId
+      ) {
+        return reply.status(403).send({ error: "FORBIDDEN_TENANT_SCOPE" });
+      }
+
+      const updated = await workflowEngine.decideApproval({
+        executionId: params.executionId,
+        stepId: body?.stepId ?? CASHFLOW_APPROVAL_STEP_ID,
+        actorId: context.user.id,
+        approved: body?.approved ?? true
+      });
+
+      return reply.status(200).send({
+        executionId: updated.id,
+        workflowStatus: updated.status
+      });
+    }
+  );
+
+  app.get(
+    "/workflows/cashflow-summary/:executionId",
+    { preHandler: requireCashflowWorkflowAccess },
+    async (request, reply) => {
+      const context = request.authContext;
+      const params = request.params as { executionId: string };
+
+      if (!context) {
+        return reply.status(401).send({ error: "UNAUTHENTICATED" });
+      }
+
+      const execution = workflowStore.getExecution(params.executionId);
+
+      if (!execution || execution.workflowType !== CASHFLOW_WORKFLOW_TYPE) {
+        return reply.status(404).send({ error: "WORKFLOW_NOT_FOUND" });
+      }
+
+      if (
+        execution.tenantId !== context.membership.tenantId ||
+        execution.organizationId !== context.membership.organizationId
+      ) {
+        return reply.status(403).send({ error: "FORBIDDEN_TENANT_SCOPE" });
+      }
+
+      const summarySnapshotId = execution.payload?.snapshot
+        ? (execution.payload.snapshot as { id: string }).id
+        : undefined;
+
+      return reply.status(200).send({
+        execution,
+        events: workflowStore.listEvents(execution.id),
+        snapshot: summarySnapshotId ? cashflowSummaryStore.get(summarySnapshotId) : null
       });
     }
   );

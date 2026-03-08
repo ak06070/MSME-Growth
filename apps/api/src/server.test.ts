@@ -439,4 +439,79 @@ describe("api auth and tenancy foundation", () => {
 
     await app.close();
   });
+
+  it("generates cashflow summary workflow with risk flags", async () => {
+    const app = buildServer();
+    const cookie = await loginAsAdmin(app);
+
+    const csv = [
+      "invoice_number,invoice_date,due_date,customer_external_code,customer_name,subtotal_amount,tax_amount,total_amount,currency",
+      "INV-CF-001,2026-01-01,2026-01-20,CF001,Cashflow Customer,5000,900,5900,INR"
+    ].join("\n");
+
+    await app.inject({
+      method: "POST",
+      url: "/ingestion/invoices/csv",
+      headers: { cookie },
+      payload: { csvContent: csv }
+    });
+
+    const response = await app.inject({
+      method: "POST",
+      url: "/workflows/cashflow-summary/generate",
+      headers: { cookie },
+      payload: {
+        triggerType: "manual",
+        windowDays: 90
+      }
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json().workflowStatus).toBe("awaiting_approval");
+    expect(response.json().snapshot.totalOutstanding).toBeGreaterThan(0);
+    expect(response.json().snapshot.riskFlags.length).toBeGreaterThan(0);
+
+    await app.close();
+  });
+
+  it("approves and retrieves cashflow summary workflow", async () => {
+    const app = buildServer();
+    const cookie = await loginAsAdmin(app);
+
+    const response = await app.inject({
+      method: "POST",
+      url: "/workflows/cashflow-summary/generate",
+      headers: { cookie },
+      payload: {
+        triggerType: "manual",
+        windowDays: 30
+      }
+    });
+
+    const executionId = response.json().executionId as string;
+
+    const approval = await app.inject({
+      method: "POST",
+      url: `/workflows/cashflow-summary/${executionId}/approve`,
+      headers: { cookie },
+      payload: {
+        approved: true
+      }
+    });
+
+    expect(approval.statusCode).toBe(200);
+    expect(approval.json().workflowStatus).toBe("completed");
+
+    const details = await app.inject({
+      method: "GET",
+      url: `/workflows/cashflow-summary/${executionId}`,
+      headers: { cookie }
+    });
+
+    expect(details.statusCode).toBe(200);
+    expect(details.json().execution.status).toBe("completed");
+    expect(details.json().snapshot).toBeTruthy();
+
+    await app.close();
+  });
 });
