@@ -18,11 +18,11 @@
 | AUTH-08 | Update docs and implementation notes | AUTH-01 to AUTH-07 | Spec docs, API contracts, and risks are updated | Documentation review checklist | Docs-only rollback if needed |
 
 ## Completion Checklist
-- [ ] AUTH-01 Auth types and permission catalog
-- [ ] AUTH-02 Core model contracts
-- [ ] AUTH-03 Session endpoints
-- [ ] AUTH-04 Tenant context middleware
-- [ ] AUTH-05 RBAC guards
-- [ ] AUTH-06 Admin management endpoints
-- [ ] AUTH-07 Audit logging coverage
-- [ ] AUTH-08 Documentation + implementation notes
+- [x] AUTH-01 Auth types and permission catalog
+- [x] AUTH-02 Core model contracts
+- [x] AUTH-03 Session endpoints
+- [x] AUTH-04 Tenant context middleware
+- [x] AUTH-05 RBAC guards
+- [x] AUTH-06 Admin management endpoints
+- [x] AUTH-07 Audit logging coverage
+- [x] AUTH-08 Documentation + implementation notes

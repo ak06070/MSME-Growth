@@ -1,6 +1,6 @@
 # Spec 002 - Auth, RBAC, Tenant Isolation, Audit Logging
 
-- Status: Approved for implementation
+- Status: Implemented
 - Last updated: 2026-03-08
 - Depends on: Spec 001 Foundation
 

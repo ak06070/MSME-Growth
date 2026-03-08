@@ -9,7 +9,70 @@ export interface TenantContext {
   correlationId?: string;
 }
 
-export type AuditAction = "create" | "update" | "delete" | "admin";
+export type UserStatus = "invited" | "active" | "suspended" | "deactivated";
+export type TenantStatus = "active" | "inactive";
+export type RoleKey =
+  | "owner"
+  | "finance_manager"
+  | "accountant"
+  | "collections_agent"
+  | "auditor"
+  | "admin";
+export type PermissionKey =
+  | "users:invite"
+  | "users:read"
+  | "users:update"
+  | "users:suspend"
+  | "roles:assign"
+  | "audit:read";
+
+export interface User {
+  id: string;
+  email: string;
+  passwordHash: string;
+  status: UserStatus;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface Tenant {
+  id: TenantId;
+  name: string;
+  status: TenantStatus;
+}
+
+export interface Organization {
+  id: OrganizationId;
+  tenantId: TenantId;
+  name: string;
+}
+
+export interface Membership {
+  id: string;
+  userId: string;
+  tenantId: TenantId;
+  organizationId: OrganizationId;
+  roles: RoleKey[];
+  isActive: boolean;
+}
+
+export interface SessionRecord {
+  id: string;
+  userId: string;
+  tenantId: TenantId;
+  organizationId: OrganizationId;
+  expiresAt: string;
+  revokedAt?: string;
+}
+
+export type AuditAction =
+  | "create"
+  | "update"
+  | "delete"
+  | "admin"
+  | "login"
+  | "logout"
+  | "access_denied";
 
 export interface AuditEvent {
   actorId?: string;
