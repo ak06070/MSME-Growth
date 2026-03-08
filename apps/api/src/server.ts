@@ -5,6 +5,8 @@ import type { PermissionKey, RoleKey, UserStatus } from "@msme/types";
 import { InMemoryAuditLogger } from "./audit";
 import { InMemoryAuthStore, type AuthContext } from "./auth-store";
 import { loadApiEnv } from "./env";
+import { InMemoryInvoiceDomainStore } from "./ingestion/invoice-domain-store";
+import { InvoiceIngestionService } from "./ingestion/invoice-ingestion-service";
 import { createLogger } from "./logger";
 import { noopObservabilityHooks } from "./observability";
 
@@ -31,6 +33,7 @@ declare module "fastify" {
 export interface ServerDeps {
   auditLogger?: InMemoryAuditLogger;
   authStore?: InMemoryAuthStore;
+  invoiceDomainStore?: InMemoryInvoiceDomainStore;
 }
 
 const resolveSessionId = (request: FastifyRequest): string | null => {
@@ -72,6 +75,8 @@ export const buildServer = (deps: ServerDeps = {}): FastifyInstance => {
   const logger = createLogger();
   const auditLogger = deps.auditLogger ?? new InMemoryAuditLogger();
   const authStore = deps.authStore ?? new InMemoryAuthStore();
+  const invoiceDomainStore = deps.invoiceDomainStore ?? new InMemoryInvoiceDomainStore();
+  const invoiceIngestionService = new InvoiceIngestionService(invoiceDomainStore, auditLogger);
 
   const app = Fastify({ logger: false });
 
@@ -264,6 +269,30 @@ export const buildServer = (deps: ServerDeps = {}): FastifyInstance => {
       activeOrganizationId: context.membership.organizationId,
       permissions: context.permissions
     });
+  });
+
+  app.post("/ingestion/invoices/csv", { preHandler: requireAuth }, async (request, reply) => {
+    const context = request.authContext;
+
+    if (!context) {
+      return reply.status(401).send({ error: "UNAUTHENTICATED" });
+    }
+
+    const body = request.body as { csvContent?: string; runLabel?: string };
+
+    if (!body?.csvContent) {
+      return reply.status(400).send({ error: "MISSING_CSV_CONTENT" });
+    }
+
+    const result = await invoiceIngestionService.ingestCsv({
+      actorId: context.user.id,
+      tenantId: context.membership.tenantId,
+      organizationId: context.membership.organizationId,
+      csvContent: body.csvContent,
+      runLabel: body.runLabel
+    });
+
+    return reply.status(200).send(result);
   });
 
   app.post(

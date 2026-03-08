@@ -10,6 +10,20 @@ const extractCookie = (setCookieHeader: string | string[] | undefined): string =
   return first.split(";")[0];
 };
 
+const loginAsAdmin = async (app: ReturnType<typeof buildServer>): Promise<string> => {
+  const login = await app.inject({
+    method: "POST",
+    url: "/auth/login",
+    payload: {
+      email: "admin@msme.local",
+      password: "Admin@123"
+    }
+  });
+
+  expect(login.statusCode).toBe(200);
+  return extractCookie(login.headers["set-cookie"]);
+};
+
 describe("api auth and tenancy foundation", () => {
   it("returns health payload", async () => {
     const app = buildServer();
@@ -224,6 +238,127 @@ describe("api auth and tenancy foundation", () => {
     });
 
     expect(session.statusCode).toBe(401);
+
+    await app.close();
+  });
+
+  it("ingests valid CSV invoices", async () => {
+    const app = buildServer();
+    const cookie = await loginAsAdmin(app);
+
+    const csvContent = [
+      "invoice_number,invoice_date,due_date,customer_external_code,customer_name,subtotal_amount,tax_amount,total_amount,currency",
+      "INV-CSV-001,2026-03-01,2026-03-15,CUST001,Acme Traders,1000,180,1180,INR"
+    ].join("\n");
+
+    const response = await app.inject({
+      method: "POST",
+      url: "/ingestion/invoices/csv",
+      headers: { cookie },
+      payload: {
+        csvContent
+      }
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toMatchObject({
+      status: "completed",
+      summary: {
+        totalRows: 1,
+        successfulRows: 1,
+        duplicateRows: 0,
+        failedRows: 0
+      }
+    });
+
+    await app.close();
+  });
+
+  it("skips duplicate invoice rows", async () => {
+    const app = buildServer();
+    const cookie = await loginAsAdmin(app);
+
+    const csvContent = [
+      "invoice_number,invoice_date,due_date,customer_external_code,customer_name,subtotal_amount,tax_amount,total_amount,currency",
+      "INV-CSV-DUP,2026-03-01,2026-03-15,CUST001,Acme Traders,1000,180,1180,INR"
+    ].join("\n");
+
+    await app.inject({
+      method: "POST",
+      url: "/ingestion/invoices/csv",
+      headers: { cookie },
+      payload: {
+        csvContent
+      }
+    });
+
+    const duplicateRun = await app.inject({
+      method: "POST",
+      url: "/ingestion/invoices/csv",
+      headers: { cookie },
+      payload: {
+        csvContent
+      }
+    });
+
+    expect(duplicateRun.statusCode).toBe(200);
+    expect(duplicateRun.json()).toMatchObject({
+      status: "partial_success",
+      summary: {
+        totalRows: 1,
+        successfulRows: 0,
+        duplicateRows: 1,
+        failedRows: 0
+      }
+    });
+
+    await app.close();
+  });
+
+  it("returns row errors for invalid CSV rows", async () => {
+    const app = buildServer();
+    const cookie = await loginAsAdmin(app);
+
+    const csvContent = [
+      "invoice_number,invoice_date,due_date,customer_external_code,customer_name,subtotal_amount,tax_amount,total_amount,currency",
+      "INV-CSV-VALID,2026-03-01,2026-03-15,CUST010,Valid Customer,1000,180,1180,INR",
+      "INV-CSV-INVALID,2026-03-20,2026-03-10,CUST011,Invalid Customer,1000,180,1180,USD"
+    ].join("\n");
+
+    const response = await app.inject({
+      method: "POST",
+      url: "/ingestion/invoices/csv",
+      headers: { cookie },
+      payload: {
+        csvContent
+      }
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json().status).toBe("partial_success");
+    expect(response.json().summary).toMatchObject({
+      totalRows: 2,
+      successfulRows: 1,
+      failedRows: 1
+    });
+    expect(response.json().errors.length).toBeGreaterThan(0);
+
+    await app.close();
+  });
+
+  it("rejects unauthenticated ingestion requests", async () => {
+    const app = buildServer();
+
+    const response = await app.inject({
+      method: "POST",
+      url: "/ingestion/invoices/csv",
+      payload: {
+        csvContent:
+          "invoice_number,invoice_date,due_date,customer_external_code,customer_name,subtotal_amount,tax_amount,total_amount,currency\\nINV-1,2026-03-01,2026-03-15,CUST001,Acme,100,18,118,INR"
+      }
+    });
+
+    expect(response.statusCode).toBe(401);
 
     await app.close();
   });

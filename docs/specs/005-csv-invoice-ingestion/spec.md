@@ -1,6 +1,6 @@
 # Spec 005 - CSV Invoice Ingestion
 
-- Status: Approved for implementation
+- Status: Implemented
 - Last updated: 2026-03-08
 - Depends on: Spec 003 Core Domain Model, Spec 004 Connector Framework
 
