@@ -39,12 +39,19 @@ export interface Tenant {
   id: TenantId;
   name: string;
   status: TenantStatus;
+  createdAt?: string;
+  updatedAt?: string;
 }
 
 export interface Organization {
   id: OrganizationId;
   tenantId: TenantId;
   name: string;
+  legalName?: string;
+  gstin?: string;
+  status?: TenantStatus;
+  createdAt?: string;
+  updatedAt?: string;
 }
 
 export interface Membership {
@@ -132,3 +139,8 @@ export class AppError extends Error {
     this.details = details;
   }
 }
+
+export * from "./core-domain";
+export * from "./core-domain.fixtures";
+export * from "./core-domain.schemas";
+export * from "./core-domain.validators";
