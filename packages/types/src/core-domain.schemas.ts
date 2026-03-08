@@ -144,6 +144,6 @@ export const notificationRecordSchema = {
     channel: { enum: ["in_app", "email", "whatsapp"] },
     templateKey: { type: "string", minLength: 1 },
     recipientRef: { type: "string", minLength: 1 },
-    status: { enum: ["queued", "sent", "failed"] }
+    status: { enum: ["queued", "sent", "failed", "dismissed"] }
   }
 } as const;

@@ -39,6 +39,72 @@ describe("api auth and tenancy foundation", () => {
     await app.close();
   });
 
+  it("applies pilot hardening security headers", async () => {
+    const app = buildServer();
+
+    const response = await app.inject({ method: "GET", url: "/health" });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.headers["x-content-type-options"]).toBe("nosniff");
+    expect(response.headers["x-frame-options"]).toBe("DENY");
+    expect(response.headers["referrer-policy"]).toBe("no-referrer");
+    expect(response.headers["content-security-policy"]).toContain("default-src");
+
+    await app.close();
+  });
+
+  it("exposes ops metrics for authorized users only", async () => {
+    const app = buildServer();
+
+    const adminCookie = await loginAsAdmin(app);
+
+    const adminResponse = await app.inject({
+      method: "GET",
+      url: "/ops/metrics",
+      headers: {
+        cookie: adminCookie
+      }
+    });
+
+    expect(adminResponse.statusCode).toBe(200);
+    expect(adminResponse.json().dashboard).toBeTruthy();
+
+    const sloResponse = await app.inject({
+      method: "GET",
+      url: "/ops/slo",
+      headers: {
+        cookie: adminCookie
+      }
+    });
+
+    expect(sloResponse.statusCode).toBe(200);
+    expect(sloResponse.json().slo.slos.length).toBeGreaterThan(0);
+
+    const financeLogin = await app.inject({
+      method: "POST",
+      url: "/auth/login",
+      payload: {
+        email: "finance@msme.local",
+        password: "Finance@123"
+      }
+    });
+
+    const financeCookie = extractCookie(financeLogin.headers["set-cookie"]);
+
+    const forbidden = await app.inject({
+      method: "GET",
+      url: "/ops/metrics",
+      headers: {
+        cookie: financeCookie
+      }
+    });
+
+    expect(forbidden.statusCode).toBe(403);
+    expect(forbidden.json()).toEqual({ error: "FORBIDDEN" });
+
+    await app.close();
+  });
+
   it("rejects invalid login", async () => {
     const app = buildServer();
 
@@ -78,6 +144,38 @@ describe("api auth and tenancy foundation", () => {
       url: "/auth/session",
       headers: {
         cookie
+      }
+    });
+
+    expect(session.statusCode).toBe(200);
+    expect(session.json()).toMatchObject({
+      authenticated: true,
+      userId: "usr_admin",
+      activeTenantId: "ten_001",
+      activeOrganizationId: "org_001"
+    });
+
+    await app.close();
+  });
+
+  it("issues bearer token and authenticates via authorization header", async () => {
+    const app = buildServer();
+    const cookie = await loginAsAdmin(app);
+
+    const tokenResponse = await app.inject({
+      method: "POST",
+      url: "/auth/token",
+      headers: { cookie }
+    });
+
+    expect(tokenResponse.statusCode).toBe(200);
+    const token = tokenResponse.json().token as string;
+
+    const session = await app.inject({
+      method: "GET",
+      url: "/auth/session",
+      headers: {
+        authorization: `Bearer ${token}`
       }
     });
 
@@ -315,6 +413,79 @@ describe("api auth and tenancy foundation", () => {
     await app.close();
   });
 
+  it("ingests manual invoice payloads with connector framework", async () => {
+    const app = buildServer();
+    const cookie = await loginAsAdmin(app);
+
+    const response = await app.inject({
+      method: "POST",
+      url: "/ingestion/invoices/manual",
+      headers: { cookie },
+      payload: {
+        invoices: [
+          {
+            invoiceNumber: "INV-MAN-001",
+            invoiceDate: "2026-03-01",
+            dueDate: "2026-03-20",
+            customerExternalCode: "M001",
+            customerName: "Manual Customer",
+            subtotalAmount: 2000,
+            taxAmount: 360,
+            totalAmount: 2360,
+            currency: "INR"
+          }
+        ]
+      }
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toMatchObject({
+      status: "completed",
+      summary: {
+        totalRows: 1,
+        successfulRows: 1,
+        duplicateRows: 0,
+        failedRows: 0
+      }
+    });
+
+    await app.close();
+  });
+
+  it("lists connector runs in tenant scope", async () => {
+    const app = buildServer();
+    const cookie = await loginAsAdmin(app);
+
+    const csvContent = [
+      "invoice_number,invoice_date,due_date,customer_external_code,customer_name,subtotal_amount,tax_amount,total_amount,currency",
+      "INV-RUN-001,2026-03-01,2026-03-15,CUST001,Acme Traders,1000,180,1180,INR"
+    ].join("\\n");
+
+    await app.inject({
+      method: "POST",
+      url: "/ingestion/invoices/csv",
+      headers: { cookie },
+      payload: {
+        csvContent
+      }
+    });
+
+    const response = await app.inject({
+      method: "GET",
+      url: "/ingestion/runs",
+      headers: { cookie }
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json().items.length).toBeGreaterThan(0);
+    expect(response.json().items[0]).toMatchObject({
+      tenantId: "ten_001",
+      organizationId: "org_001"
+    });
+
+    await app.close();
+  });
+
   it("returns row errors for invalid CSV rows", async () => {
     const app = buildServer();
     const cookie = await loginAsAdmin(app);
@@ -342,6 +513,155 @@ describe("api auth and tenancy foundation", () => {
       failedRows: 1
     });
     expect(response.json().errors.length).toBeGreaterThan(0);
+
+    await app.close();
+  });
+
+  it("creates in-app notifications, tracks inbox, and supports dismiss", async () => {
+    const app = buildServer();
+    const cookie = await loginAsAdmin(app);
+
+    const template = await app.inject({
+      method: "POST",
+      url: "/notifications/templates",
+      headers: { cookie },
+      payload: {
+        channel: "in_app",
+        templateKey: "collections_inapp_v1",
+        version: 1,
+        body: "Reminder for {{customerName}}",
+        allowedVariables: ["customerName"]
+      }
+    });
+
+    expect(template.statusCode).toBe(201);
+
+    const queued = await app.inject({
+      method: "POST",
+      url: "/notifications",
+      headers: { cookie },
+      payload: {
+        channel: "in_app",
+        templateKey: "collections_inapp_v1",
+        recipientRef: "usr_admin",
+        variables: {
+          customerName: "Acme Traders"
+        }
+      }
+    });
+
+    expect(queued.statusCode).toBe(201);
+    expect(queued.json().notification.status).toBe("sent");
+    const notificationId = queued.json().notification.id as string;
+
+    const inbox = await app.inject({
+      method: "GET",
+      url: "/notifications/inbox?recipientRef=usr_admin",
+      headers: { cookie }
+    });
+
+    expect(inbox.statusCode).toBe(200);
+    expect(inbox.json().unreadCount).toBeGreaterThan(0);
+
+    const dismiss = await app.inject({
+      method: "POST",
+      url: `/notifications/${notificationId}/dismiss`,
+      headers: { cookie }
+    });
+
+    expect(dismiss.statusCode).toBe(200);
+    expect(dismiss.json().notification.status).toBe("dismissed");
+
+    const attempts = await app.inject({
+      method: "GET",
+      url: `/notifications/${notificationId}/attempts`,
+      headers: { cookie }
+    });
+
+    expect(attempts.statusCode).toBe(200);
+    expect(attempts.json().items[0].status).toBe("sent");
+
+    await app.close();
+  });
+
+  it("requires approval for outbound notification sends and logs failures", async () => {
+    const app = buildServer();
+    const cookie = await loginAsAdmin(app);
+
+    await app.inject({
+      method: "POST",
+      url: "/notifications/templates",
+      headers: { cookie },
+      payload: {
+        channel: "email",
+        templateKey: "collections_email_v1",
+        version: 1,
+        subject: "Follow-up {{invoiceNumber}}",
+        body: "Invoice {{invoiceNumber}} is overdue by {{daysOverdue}} days.",
+        allowedVariables: ["invoiceNumber", "daysOverdue"]
+      }
+    });
+
+    const queued = await app.inject({
+      method: "POST",
+      url: "/notifications",
+      headers: { cookie },
+      payload: {
+        channel: "email",
+        templateKey: "collections_email_v1",
+        recipientRef: "owner@example.com",
+        variables: {
+          invoiceNumber: "INV-1001",
+          daysOverdue: 14
+        },
+        requiresApproval: true,
+        autoSend: false
+      }
+    });
+
+    expect(queued.statusCode).toBe(201);
+    const notificationId = queued.json().notification.id as string;
+
+    const blockedSend = await app.inject({
+      method: "POST",
+      url: `/notifications/${notificationId}/send`,
+      headers: { cookie }
+    });
+
+    expect(blockedSend.statusCode).toBe(409);
+    expect(blockedSend.json().error).toBe("APPROVAL_REQUIRED");
+
+    const approval = await app.inject({
+      method: "POST",
+      url: `/notifications/${notificationId}/approve`,
+      headers: { cookie },
+      payload: {
+        approved: true,
+        rationale: "Business-approved reminder"
+      }
+    });
+
+    expect(approval.statusCode).toBe(200);
+    expect(approval.json().approval.decision).toBe("approved");
+
+    const send = await app.inject({
+      method: "POST",
+      url: `/notifications/${notificationId}/send`,
+      headers: { cookie }
+    });
+
+    expect(send.statusCode).toBe(200);
+    expect(send.json().notification.status).toBe("failed");
+    expect(send.json().notification.failureCode).toBe("CHANNEL_NOT_CONFIGURED");
+
+    const attempts = await app.inject({
+      method: "GET",
+      url: `/notifications/${notificationId}/attempts`,
+      headers: { cookie }
+    });
+
+    expect(attempts.statusCode).toBe(200);
+    expect(attempts.json().items[0].status).toBe("failed");
 
     await app.close();
   });

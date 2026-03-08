@@ -1,15 +1,21 @@
 import cookie from "@fastify/cookie";
 import Fastify, { type FastifyInstance, type FastifyReply, type FastifyRequest } from "fastify";
 import { randomUUID } from "node:crypto";
-import type { PermissionKey, RoleKey, UserStatus } from "@msme/types";
+import { AppError, type PermissionKey, type RoleKey, type UserStatus } from "@msme/types";
 import { InMemoryWorkflowStore, WorkflowEngine, WorkflowRegistry } from "@msme/workflows";
 import { InMemoryAuditLogger } from "./audit";
+import { HmacTokenAuthProvider } from "./auth-provider";
 import { InMemoryAuthStore, type AuthContext } from "./auth-store";
 import { loadApiEnv } from "./env";
+import { InMemoryConnectorRunStore } from "./ingestion/connector-run-store";
 import { InMemoryInvoiceDomainStore } from "./ingestion/invoice-domain-store";
 import { InvoiceIngestionService } from "./ingestion/invoice-ingestion-service";
 import { createLogger } from "./logger";
+import { NotificationService } from "./notifications/notification-service";
+import { InMemoryNotificationStore } from "./notifications/notification-store";
 import { noopObservabilityHooks } from "./observability";
+import { PilotMetricsRegistry } from "./ops/pilot-metrics";
+import { createPlatformPersistence } from "./persistence/platform-persistence";
 import {
   COLLECTIONS_APPROVAL_STEP_ID,
   COLLECTIONS_WORKFLOW_TYPE,
@@ -49,6 +55,7 @@ declare module "fastify" {
   interface FastifyRequest {
     authContext?: AuthContext;
     sessionId?: string;
+    requestStartedAtMs?: number;
   }
 }
 
@@ -56,6 +63,8 @@ export interface ServerDeps {
   auditLogger?: InMemoryAuditLogger;
   authStore?: InMemoryAuthStore;
   invoiceDomainStore?: InMemoryInvoiceDomainStore;
+  connectorRunStore?: InMemoryConnectorRunStore;
+  notificationService?: NotificationService;
   workflowStore?: InMemoryWorkflowStore;
   cashflowSummaryStore?: InMemoryCashflowSummaryStore;
   loanReadinessStore?: InMemoryLoanReadinessStore;
@@ -75,6 +84,21 @@ const resolveSessionId = (request: FastifyRequest): string | null => {
   }
 
   return unsigned.value;
+};
+
+const resolveBearerToken = (request: FastifyRequest): string | null => {
+  const authorization = request.headers.authorization;
+
+  if (!authorization) {
+    return null;
+  }
+
+  if (!authorization.startsWith("Bearer ")) {
+    return null;
+  }
+
+  const token = authorization.slice("Bearer ".length).trim();
+  return token.length > 0 ? token : null;
 };
 
 const ensureTenantScope = (
@@ -98,13 +122,35 @@ const isValidStatus = (value: string): value is UserStatus => {
 export const buildServer = (deps: ServerDeps = {}): FastifyInstance => {
   const env = loadApiEnv();
   const logger = createLogger();
-  const auditLogger = deps.auditLogger ?? new InMemoryAuditLogger();
+  const pilotMetrics = new PilotMetricsRegistry();
+  const platformPersistence = createPlatformPersistence(env.databaseUrl);
+  const auditLogger = deps.auditLogger ?? new InMemoryAuditLogger(platformPersistence);
   const authStore = deps.authStore ?? new InMemoryAuthStore();
+  const tokenAuthProvider = new HmacTokenAuthProvider(authStore, env.authTokenSecret);
   const invoiceDomainStore = deps.invoiceDomainStore ?? new InMemoryInvoiceDomainStore();
+  const connectorRunStore = deps.connectorRunStore ?? new InMemoryConnectorRunStore(platformPersistence);
+  const notificationService =
+    deps.notificationService ??
+    new NotificationService({
+      auditLogger,
+      store: new InMemoryNotificationStore(platformPersistence),
+      providerUrls: {
+        emailWebhookUrl: env.notificationEmailWebhookUrl,
+        whatsappWebhookUrl: env.notificationWhatsappWebhookUrl
+      },
+      config: {
+        maxAttempts: env.notificationMaxAttempts,
+        retryDelayMs: env.notificationRetryDelayMs
+      }
+    });
   const workflowStore = deps.workflowStore ?? new InMemoryWorkflowStore();
   const cashflowSummaryStore = deps.cashflowSummaryStore ?? new InMemoryCashflowSummaryStore();
   const loanReadinessStore = deps.loanReadinessStore ?? new InMemoryLoanReadinessStore();
-  const invoiceIngestionService = new InvoiceIngestionService(invoiceDomainStore, auditLogger);
+  const invoiceIngestionService = new InvoiceIngestionService(
+    invoiceDomainStore,
+    auditLogger,
+    connectorRunStore
+  );
   const workflowRegistry = new WorkflowRegistry();
   const workflowEngine = new WorkflowEngine(workflowRegistry, workflowStore, async (event) => {
     await auditLogger.log({
@@ -126,15 +172,23 @@ export const buildServer = (deps: ServerDeps = {}): FastifyInstance => {
   workflowEngine.registerWorkflow(createCashflowSummaryWorkflowDefinition());
   workflowEngine.registerWorkflow(createLoanReadinessWorkflowDefinition());
 
-  const app = Fastify({ logger: false });
+  const app = Fastify({
+    logger: false,
+    bodyLimit: 2 * 1024 * 1024
+  });
 
   void app.register(cookie, {
     secret: env.sessionSecret,
     hook: "onRequest"
   });
 
+  app.addHook("onClose", async () => {
+    await platformPersistence.close();
+  });
+
   const requireAuth = async (request: FastifyRequest, reply: FastifyReply): Promise<void> => {
     if (!request.authContext || !request.sessionId) {
+      pilotMetrics.recordAuthOutcome(false);
       await auditLogger.log({
         action: "access_denied",
         actorId: "anonymous",
@@ -219,8 +273,17 @@ export const buildServer = (deps: ServerDeps = {}): FastifyInstance => {
   };
 
   app.addHook("onRequest", async (request, reply) => {
+    request.requestStartedAtMs = Date.now();
     const correlationId = request.headers["x-correlation-id"]?.toString() ?? randomUUID();
     reply.header("x-correlation-id", correlationId);
+    reply.header("x-content-type-options", "nosniff");
+    reply.header("x-frame-options", "DENY");
+    reply.header("referrer-policy", "no-referrer");
+    reply.header("content-security-policy", "default-src 'self'");
+
+    if (env.nodeEnv === "production") {
+      reply.header("strict-transport-security", "max-age=15552000; includeSubDomains");
+    }
 
     logger.info("incoming_request", {
       correlationId,
@@ -240,8 +303,36 @@ export const buildServer = (deps: ServerDeps = {}): FastifyInstance => {
       if (authContext) {
         request.sessionId = sessionId;
         request.authContext = authContext;
+        pilotMetrics.recordAuthOutcome(true);
       }
     }
+
+    if (!request.authContext) {
+      const bearerToken = resolveBearerToken(request);
+
+      if (bearerToken) {
+        const tokenContext = tokenAuthProvider.resolveAuthContext(bearerToken);
+
+        if (tokenContext) {
+          request.sessionId = tokenContext.session.id;
+          request.authContext = tokenContext;
+          pilotMetrics.recordAuthOutcome(true);
+        }
+      }
+    }
+  });
+
+  app.addHook("onResponse", async (request, reply) => {
+    const startedAt = request.requestStartedAtMs ?? Date.now();
+    const durationMs = Date.now() - startedAt;
+    const route = request.routeOptions.url ?? request.url;
+
+    pilotMetrics.recordHttpRequest({
+      method: request.method,
+      route,
+      statusCode: reply.statusCode,
+      durationMs
+    });
   });
 
   app.get("/health", async (request) => {
@@ -254,6 +345,34 @@ export const buildServer = (deps: ServerDeps = {}): FastifyInstance => {
     };
   });
 
+  app.get("/ops/metrics", { preHandler: requirePermission("audit:read") }, async (request, reply) => {
+    const context = request.authContext;
+
+    if (!context) {
+      return reply.status(401).send({ error: "UNAUTHENTICATED" });
+    }
+
+    return reply.status(200).send({
+      tenantId: context.membership.tenantId,
+      organizationId: context.membership.organizationId,
+      dashboard: pilotMetrics.snapshot()
+    });
+  });
+
+  app.get("/ops/slo", { preHandler: requirePermission("audit:read") }, async (request, reply) => {
+    const context = request.authContext;
+
+    if (!context) {
+      return reply.status(401).send({ error: "UNAUTHENTICATED" });
+    }
+
+    return reply.status(200).send({
+      tenantId: context.membership.tenantId,
+      organizationId: context.membership.organizationId,
+      slo: pilotMetrics.sloSnapshot()
+    });
+  });
+
   app.post("/auth/login", async (request, reply) => {
     const body = request.body as { email?: string; password?: string };
 
@@ -264,6 +383,7 @@ export const buildServer = (deps: ServerDeps = {}): FastifyInstance => {
     const authResult = authStore.authenticate(body.email, body.password);
 
     if (!authResult.ok) {
+      pilotMetrics.recordAuthOutcome(false);
       await auditLogger.log({
         action: "login",
         actorId: body.email,
@@ -283,6 +403,7 @@ export const buildServer = (deps: ServerDeps = {}): FastifyInstance => {
     }
 
     const session = authStore.createSession(authResult.user, authResult.membership);
+    pilotMetrics.recordAuthOutcome(true);
 
     reply.setCookie(SESSION_COOKIE, session.id, {
       path: "/",
@@ -358,6 +479,37 @@ export const buildServer = (deps: ServerDeps = {}): FastifyInstance => {
     });
   });
 
+  app.post("/auth/token", { preHandler: requireAuth }, async (request, reply) => {
+    const context = request.authContext;
+
+    if (!context) {
+      return reply.status(401).send({ error: "UNAUTHENTICATED" });
+    }
+
+    const token = tokenAuthProvider.issueToken({
+      userId: context.user.id,
+      tenantId: context.membership.tenantId,
+      organizationId: context.membership.organizationId,
+      roles: context.membership.roles
+    });
+
+    await auditLogger.log({
+      action: "admin",
+      actorId: context.user.id,
+      tenantId: context.membership.tenantId,
+      organizationId: context.membership.organizationId,
+      resourceType: "auth_token",
+      resourceId: context.user.id,
+      outcome: "success",
+      timestamp: new Date().toISOString()
+    });
+
+    return reply.status(200).send({
+      token,
+      tokenType: "Bearer"
+    });
+  });
+
   app.post("/ingestion/invoices/csv", { preHandler: requireAuth }, async (request, reply) => {
     const context = request.authContext;
 
@@ -379,8 +531,320 @@ export const buildServer = (deps: ServerDeps = {}): FastifyInstance => {
       runLabel: body.runLabel
     });
 
+    pilotMetrics.recordIngestionOutcome({
+      connectorType: result.connectorType,
+      status: result.status,
+      totalRows: result.summary.totalRows,
+      failedRows: result.summary.failedRows
+    });
+
     return reply.status(200).send(result);
   });
+
+  app.post("/ingestion/invoices/manual", { preHandler: requireAuth }, async (request, reply) => {
+    const context = request.authContext;
+
+    if (!context) {
+      return reply.status(401).send({ error: "UNAUTHENTICATED" });
+    }
+
+    const body = request.body as {
+      invoices?: Array<{
+        invoiceNumber: string;
+        invoiceDate: string;
+        dueDate: string;
+        customerExternalCode?: string;
+        customerName: string;
+        subtotalAmount: number;
+        taxAmount: number;
+        totalAmount: number;
+        currency: string;
+        sourceReference?: string;
+      }>;
+      runLabel?: string;
+      allowUpsert?: boolean;
+    };
+
+    if (!Array.isArray(body?.invoices) || body.invoices.length === 0) {
+      return reply.status(400).send({ error: "MISSING_MANUAL_INVOICE_PAYLOAD" });
+    }
+
+    const result = await invoiceIngestionService.ingestManual({
+      actorId: context.user.id,
+      tenantId: context.membership.tenantId,
+      organizationId: context.membership.organizationId,
+      invoices: body.invoices,
+      runLabel: body.runLabel,
+      allowUpsert: body.allowUpsert
+    });
+
+    pilotMetrics.recordIngestionOutcome({
+      connectorType: result.connectorType,
+      status: result.status,
+      totalRows: result.summary.totalRows,
+      failedRows: result.summary.failedRows
+    });
+
+    return reply.status(200).send(result);
+  });
+
+  app.get("/ingestion/runs", { preHandler: requireAuth }, async (request, reply) => {
+    const context = request.authContext;
+    const query = request.query as {
+      connectorType?: string;
+    };
+
+    if (!context) {
+      return reply.status(401).send({ error: "UNAUTHENTICATED" });
+    }
+
+    const items = invoiceIngestionService.listConnectorRuns({
+      tenantId: context.membership.tenantId,
+      organizationId: context.membership.organizationId,
+      connectorType: query.connectorType
+    });
+
+    return reply.status(200).send({ items });
+  });
+
+  app.post(
+    "/notifications/templates",
+    { preHandler: requirePermission("users:update") },
+    async (request, reply) => {
+      const context = request.authContext;
+      const body = request.body as {
+        channel?: "in_app" | "email" | "whatsapp";
+        templateKey?: string;
+        version?: number;
+        subject?: string;
+        body?: string;
+        allowedVariables?: string[];
+      };
+
+      if (!context) {
+        return reply.status(401).send({ error: "UNAUTHENTICATED" });
+      }
+
+      if (!body?.channel || !body.templateKey || !body.version || !body.body) {
+        return reply.status(400).send({ error: "INVALID_TEMPLATE_PAYLOAD" });
+      }
+
+      const template = notificationService.registerTemplate({
+        actorId: context.user.id,
+        tenantId: context.membership.tenantId,
+        organizationId: context.membership.organizationId,
+        channel: body.channel,
+        templateKey: body.templateKey,
+        version: body.version,
+        subject: body.subject,
+        body: body.body,
+        allowedVariables: body.allowedVariables ?? []
+      });
+
+      return reply.status(201).send({ template });
+    }
+  );
+
+  app.get("/notifications/templates", { preHandler: requireAuth }, async (request, reply) => {
+    const context = request.authContext;
+    const query = request.query as {
+      channel?: "in_app" | "email" | "whatsapp";
+      templateKey?: string;
+    };
+
+    if (!context) {
+      return reply.status(401).send({ error: "UNAUTHENTICATED" });
+    }
+
+    const items = notificationService.listTemplates({
+      tenantId: context.membership.tenantId,
+      organizationId: context.membership.organizationId,
+      channel: query.channel,
+      templateKey: query.templateKey
+    });
+
+    return reply.status(200).send({ items });
+  });
+
+  app.post("/notifications", { preHandler: requireAuth }, async (request, reply) => {
+    const context = request.authContext;
+    const body = request.body as {
+      channel?: "in_app" | "email" | "whatsapp";
+      templateKey?: string;
+      templateVersion?: number;
+      recipientRef?: string;
+      variables?: Record<string, string | number | boolean | null>;
+      correlationRef?: string;
+      workflowRef?: string;
+      requiresApproval?: boolean;
+      autoSend?: boolean;
+    };
+
+    if (!context) {
+      return reply.status(401).send({ error: "UNAUTHENTICATED" });
+    }
+
+    if (!body?.channel || !body.templateKey || !body.recipientRef || !body.variables) {
+      return reply.status(400).send({ error: "INVALID_NOTIFICATION_PAYLOAD" });
+    }
+
+    const notification = await notificationService.queueNotification({
+      actorId: context.user.id,
+      tenantId: context.membership.tenantId,
+      organizationId: context.membership.organizationId,
+      channel: body.channel,
+      templateKey: body.templateKey,
+      templateVersion: body.templateVersion,
+      recipientRef: body.recipientRef,
+      variables: body.variables,
+      correlationRef: body.correlationRef,
+      workflowRef: body.workflowRef,
+      requiresApproval: body.requiresApproval,
+      autoSend: body.autoSend
+    });
+
+    pilotMetrics.recordNotificationOutcome({
+      channel: notification.channel,
+      status: notification.status
+    });
+
+    return reply.status(201).send({ notification });
+  });
+
+  app.post(
+    "/notifications/:notificationId/approve",
+    { preHandler: requirePermission("users:update") },
+    async (request, reply) => {
+      const context = request.authContext;
+      const params = request.params as { notificationId: string };
+      const body = request.body as { approved?: boolean; rationale?: string };
+
+      if (!context) {
+        return reply.status(401).send({ error: "UNAUTHENTICATED" });
+      }
+
+      if (typeof body?.approved !== "boolean") {
+        return reply.status(400).send({ error: "INVALID_APPROVAL_PAYLOAD" });
+      }
+
+      const approval = notificationService.approveNotification({
+        actorId: context.user.id,
+        tenantId: context.membership.tenantId,
+        organizationId: context.membership.organizationId,
+        notificationId: params.notificationId,
+        approved: body.approved,
+        rationale: body.rationale
+      });
+
+      return reply.status(200).send({ approval });
+    }
+  );
+
+  app.post("/notifications/:notificationId/send", { preHandler: requireAuth }, async (request, reply) => {
+    const context = request.authContext;
+    const params = request.params as { notificationId: string };
+
+    if (!context) {
+      return reply.status(401).send({ error: "UNAUTHENTICATED" });
+    }
+
+    const delivery = await notificationService.sendNotification({
+      actorId: context.user.id,
+      tenantId: context.membership.tenantId,
+      organizationId: context.membership.organizationId,
+      notificationId: params.notificationId
+    });
+
+    pilotMetrics.recordNotificationOutcome({
+      channel: delivery.notification.channel,
+      status: delivery.notification.status
+    });
+
+    return reply.status(200).send(delivery);
+  });
+
+  app.post("/notifications/:notificationId/retry", { preHandler: requireAuth }, async (request, reply) => {
+    const context = request.authContext;
+    const params = request.params as { notificationId: string };
+
+    if (!context) {
+      return reply.status(401).send({ error: "UNAUTHENTICATED" });
+    }
+
+    const delivery = await notificationService.retryNotification({
+      actorId: context.user.id,
+      tenantId: context.membership.tenantId,
+      organizationId: context.membership.organizationId,
+      notificationId: params.notificationId
+    });
+
+    pilotMetrics.recordNotificationOutcome({
+      channel: delivery.notification.channel,
+      status: delivery.notification.status
+    });
+
+    return reply.status(200).send(delivery);
+  });
+
+  app.post(
+    "/notifications/:notificationId/dismiss",
+    { preHandler: requireAuth },
+    async (request, reply) => {
+      const context = request.authContext;
+      const params = request.params as { notificationId: string };
+
+      if (!context) {
+        return reply.status(401).send({ error: "UNAUTHENTICATED" });
+      }
+
+      const notification = notificationService.dismissNotification({
+        actorId: context.user.id,
+        tenantId: context.membership.tenantId,
+        organizationId: context.membership.organizationId,
+        notificationId: params.notificationId
+      });
+
+      return reply.status(200).send({ notification });
+    }
+  );
+
+  app.get("/notifications/inbox", { preHandler: requireAuth }, async (request, reply) => {
+    const context = request.authContext;
+    const query = request.query as { recipientRef?: string };
+
+    if (!context) {
+      return reply.status(401).send({ error: "UNAUTHENTICATED" });
+    }
+
+    const inbox = notificationService.listInbox({
+      tenantId: context.membership.tenantId,
+      organizationId: context.membership.organizationId,
+      recipientRef: query.recipientRef ?? context.user.id
+    });
+
+    return reply.status(200).send(inbox);
+  });
+
+  app.get(
+    "/notifications/:notificationId/attempts",
+    { preHandler: requireAuth },
+    async (request, reply) => {
+      const context = request.authContext;
+      const params = request.params as { notificationId: string };
+
+      if (!context) {
+        return reply.status(401).send({ error: "UNAUTHENTICATED" });
+      }
+
+      const items = notificationService.listAttempts({
+        tenantId: context.membership.tenantId,
+        organizationId: context.membership.organizationId,
+        notificationId: params.notificationId
+      });
+
+      return reply.status(200).send({ items });
+    }
+  );
 
   app.post(
     "/workflows/collections-followup/start",
@@ -445,6 +909,8 @@ export const buildServer = (deps: ServerDeps = {}): FastifyInstance => {
         }
       });
 
+      pilotMetrics.recordWorkflowOutcome(COLLECTIONS_WORKFLOW_TYPE, execution.status);
+
       return reply.status(200).send({
         executionId: execution.id,
         workflowStatus: execution.status,
@@ -484,6 +950,8 @@ export const buildServer = (deps: ServerDeps = {}): FastifyInstance => {
         actorId: context.user.id,
         approved: body?.approved ?? true
       });
+
+      pilotMetrics.recordWorkflowOutcome(COLLECTIONS_WORKFLOW_TYPE, updated.status);
 
       return reply.status(200).send({
         executionId: updated.id,
@@ -560,6 +1028,8 @@ export const buildServer = (deps: ServerDeps = {}): FastifyInstance => {
         }
       });
 
+      pilotMetrics.recordWorkflowOutcome(CASHFLOW_WORKFLOW_TYPE, execution.status);
+
       return reply.status(200).send({
         executionId: execution.id,
         workflowStatus: execution.status,
@@ -599,6 +1069,8 @@ export const buildServer = (deps: ServerDeps = {}): FastifyInstance => {
         actorId: context.user.id,
         approved: body?.approved ?? true
       });
+
+      pilotMetrics.recordWorkflowOutcome(CASHFLOW_WORKFLOW_TYPE, updated.status);
 
       return reply.status(200).send({
         executionId: updated.id,
@@ -741,6 +1213,8 @@ export const buildServer = (deps: ServerDeps = {}): FastifyInstance => {
         }
       });
 
+      pilotMetrics.recordWorkflowOutcome(LOAN_READINESS_WORKFLOW_TYPE, execution.status);
+
       return reply.status(200).send({
         executionId: execution.id,
         workflowStatus: execution.status,
@@ -780,6 +1254,8 @@ export const buildServer = (deps: ServerDeps = {}): FastifyInstance => {
         actorId: context.user.id,
         approved: body?.approved ?? true
       });
+
+      pilotMetrics.recordWorkflowOutcome(LOAN_READINESS_WORKFLOW_TYPE, updated.status);
 
       const workspacePayload = updated.payload?.workspace as { id: string } | undefined;
 
@@ -1065,6 +1541,14 @@ export const buildServer = (deps: ServerDeps = {}): FastifyInstance => {
   );
 
   app.setErrorHandler((error, request, reply) => {
+    if (error instanceof AppError) {
+      return reply.status(error.statusCode).send({
+        error: error.code,
+        message: error.message,
+        details: error.details
+      });
+    }
+
     const message = error instanceof Error ? error.message : "unknown_error";
 
     logger.error("request_failed", {

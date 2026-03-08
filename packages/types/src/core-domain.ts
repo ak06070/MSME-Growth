@@ -142,7 +142,7 @@ export interface WorkflowInstance {
   errorCode?: string;
 }
 
-export type NotificationStatus = "queued" | "sent" | "failed";
+export type NotificationStatus = "queued" | "sent" | "failed" | "dismissed";
 
 export interface NotificationRecord {
   id: string;

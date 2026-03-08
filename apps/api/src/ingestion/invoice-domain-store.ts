@@ -43,7 +43,15 @@ export class InMemoryInvoiceDomainStore {
   }
 
   hasInvoice(tenantId: string, organizationId: string, invoiceNumber: string): boolean {
-    return this.invoices.some(
+    return Boolean(this.findInvoiceByNumber(tenantId, organizationId, invoiceNumber));
+  }
+
+  findInvoiceByNumber(
+    tenantId: string,
+    organizationId: string,
+    invoiceNumber: string
+  ): Invoice | undefined {
+    return this.invoices.find(
       (invoice) =>
         invoice.tenantId === tenantId &&
         invoice.organizationId === organizationId &&
@@ -51,8 +59,29 @@ export class InMemoryInvoiceDomainStore {
     );
   }
 
-  saveInvoice(invoice: Invoice): void {
+  saveInvoice(invoice: Invoice, mode: "insert" | "upsert" = "insert"): Invoice {
+    if (mode === "upsert") {
+      const existingIndex = this.invoices.findIndex(
+        (candidate) =>
+          candidate.tenantId === invoice.tenantId &&
+          candidate.organizationId === invoice.organizationId &&
+          candidate.invoiceNumber === invoice.invoiceNumber
+      );
+
+      if (existingIndex >= 0) {
+        const existing = this.invoices[existingIndex];
+        const updated: Invoice = {
+          ...existing,
+          ...invoice,
+          id: existing.id
+        };
+        this.invoices[existingIndex] = updated;
+        return updated;
+      }
+    }
+
     this.invoices.push(invoice);
+    return invoice;
   }
 
   listInvoices(): Invoice[] {

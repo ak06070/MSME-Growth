@@ -144,3 +144,4 @@ export * from "./core-domain";
 export * from "./core-domain.fixtures";
 export * from "./core-domain.schemas";
 export * from "./core-domain.validators";
+export * from "./notifications";

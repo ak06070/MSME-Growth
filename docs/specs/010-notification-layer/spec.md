@@ -1,6 +1,6 @@
 # Spec 010 - Notification Layer
 
-- Status: Approved for implementation
+- Status: Implemented
 - Last updated: 2026-03-08
 - Depends on: Spec 006 Workflow Engine, Spec 007/008/009 workflow specs
 

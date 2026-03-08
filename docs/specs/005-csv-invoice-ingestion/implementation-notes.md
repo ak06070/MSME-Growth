@@ -36,6 +36,6 @@ Successful commands:
 
 ## Remaining Gaps (Out of Scope)
 - multipart file upload transport
-- persistent ingestion run history tables
+- advanced connector orchestration worker model for high-volume asynchronous jobs
 - downloadable error report artifact storage
 - advanced CSV parser edge-case handling
