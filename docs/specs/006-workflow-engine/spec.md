@@ -1,6 +1,6 @@
 # Spec 006 - Workflow Engine
 
-- Status: Approved for implementation
+- Status: Implemented
 - Last updated: 2026-03-08
 - Depends on: Spec 001 Foundation, Spec 003 Core Domain Model
 
